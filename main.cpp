@@ -7,6 +7,11 @@
 #include <vector>
 #include <TlHelp32.h>
 #include <Shlwapi.h>
+#include <atomic>
+#include <cstring>
+#include <limits>
+#include <mutex>
+#include <thread>
 #pragma comment(lib,"shlwapi.lib")
 
 #define RESET   "\033[0m"
@@ -33,6 +38,29 @@ struct ProcessInfo {
     std::string name;
     bool hasWindows;
 };
+
+// Global DLL paths
+std::wstring g_hideDllPath;
+std::wstring g_unhideDllPath;
+std::wstring g_statusDllPath;
+std::wstring g_transDllPath;
+std::wstring g_hideDll32Path;
+std::wstring g_unhideDll32Path;
+std::wstring g_statusDll32Path;
+std::wstring g_transDll32Path;
+
+// Monitoring controls
+std::atomic<bool> g_monitoring{ false };
+std::atomic<bool> g_stopMonitoring{ false };
+std::thread g_monitorThread;
+std::mutex g_monitorMutex;
+std::string g_targetProcessName;
+
+// Function declarations
+void StopMonitoring();
+bool InjectDLL(DWORD pid, const std::wstring& dllPath);
+std::vector<ProcessInfo> GetProcessList();
+void MonitorProcessAffinity();
 
 // Function to log messages
 void Log(const char* format, ...) {
@@ -89,7 +117,7 @@ std::vector<ProcessInfo> GetProcessList() {
     }
 
     PROCESSENTRY32 pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32);  // ¹Ø¼üÉèÖÃ
+    pe32.dwSize = sizeof(PROCESSENTRY32);  // ï¿½Ø¼ï¿½ï¿½ï¿½ï¿½ï¿½
 
     if (!Process32First(hProcessSnap, &pe32)) {
         CloseHandle(hProcessSnap);
@@ -101,12 +129,12 @@ std::vector<ProcessInfo> GetProcessList() {
         ProcessInfo pi;
         pi.pid = pe32.th32ProcessID;
 
-        // ×ª»»½ø³ÌÃû£¨¿í×Ö·û ¡ú ¶à×Ö½Ú£©
+        // ×ªï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö·ï¿½ ï¿½ï¿½ ï¿½ï¿½ï¿½Ö½Ú£ï¿½
         char exeName[MAX_PATH];
         WideCharToMultiByte(CP_ACP, 0, pe32.szExeFile, -1, exeName, MAX_PATH, NULL, NULL);
         pi.name = exeName;
 
-        // ´°¿Ú¼ì²éÂß¼­
+        // ï¿½ï¿½ï¿½Ú¼ï¿½ï¿½ï¿½ß¼ï¿½
         pi.hasWindows = false;
         EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
             ProcessInfo* pPi = reinterpret_cast<ProcessInfo*>(lParam);
@@ -115,7 +143,7 @@ std::vector<ProcessInfo> GetProcessList() {
 
             if (pid == pPi->pid && IsWindowVisible(hwnd)) {
                 pPi->hasWindows = true;
-                return FALSE;  // ÕÒµ½´°¿ÚºóÁ¢¼´Í£Ö¹Ã¶¾Ù
+                return FALSE;  // ï¿½Òµï¿½ï¿½ï¿½ï¿½Úºï¿½ï¿½ï¿½ï¿½ï¿½Í£Ö¹Ã¶ï¿½ï¿½
             }
             return TRUE;
             }, reinterpret_cast<LPARAM>(&pi));
@@ -125,6 +153,51 @@ std::vector<ProcessInfo> GetProcessList() {
 
     CloseHandle(hProcessSnap);
     return processes;
+}
+
+// Monitor target process and set display affinity to normal when found
+void MonitorProcessAffinity() {
+    while (!g_stopMonitoring) {
+        std::string targetName;
+        {
+            std::lock_guard<std::mutex> lock(g_monitorMutex);
+            targetName = g_targetProcessName;
+        }
+
+        if (!targetName.empty()) {
+            auto processes = GetProcessList();
+            for (const auto& proc : processes) {
+                if (_stricmp(proc.name.c_str(), targetName.c_str()) == 0) {
+                    Log("Detected target process %s (PID: %d). Setting display affinity to normal...", proc.name.c_str(), proc.pid);
+                    bool success = InjectDLL(proc.pid, g_unhideDllPath) && InjectDLL(proc.pid, g_unhideDll32Path);
+                    if (success) {
+                        Log("Successfully set display affinity to normal for %s.", proc.name.c_str());
+                    }
+                    else {
+                        Log("Failed to set display affinity for %s.", proc.name.c_str());
+                    }
+                }
+            }
+        }
+
+        for (int i = 0; i < 20 && !g_stopMonitoring; ++i) {
+            Sleep(1000);
+        }
+    }
+
+    g_monitoring = false;
+}
+
+// Stop monitoring thread safely
+void StopMonitoring() {
+    if (g_monitoring) {
+        g_stopMonitoring = true;
+        if (g_monitorThread.joinable()) {
+            g_monitorThread.join();
+        }
+    }
+    g_monitoring = false;
+    g_stopMonitoring = false;
 }
 
 // Inject DLL into a process
@@ -204,6 +277,7 @@ void ShowMainMenu() {
     cout << "3. Set to WDA_MONITOR (protected from capture)" << endl;
     cout << "4. Set to WDA_EXCLUDEFROMCAPTURE (exluded from capture)" << endl;
     cout << YELLOW << "5. Get current display affinity status" << endl;
+    cout << BLUE << "6. Start/Update continuous monitoring" << endl;
     cout << RED << "0. Exit" << endl;
     cout << RESET << "============= ICER233 @ LCG-52POJIE =============" << endl << endl;
     cout << "Selection: ";
@@ -218,55 +292,55 @@ int main() {
     }
 
     // Check if DLLs exist
-    std::wstring hideDllPath = GetFullFilePath(L"AffinityHide.dll");
-    std::wstring unhideDllPath = GetFullFilePath(L"AffinityUnhide.dll");
-    std::wstring statusDllPath = GetFullFilePath(L"AffinityStatus.dll");
-    std::wstring transDllPath = GetFullFilePath(L"AffinityTrans.dll");
-    std::wstring hideDll32Path = GetFullFilePath(L"AffinityHide32.dll");
-    std::wstring unhideDll32Path = GetFullFilePath(L"AffinityUnhide32.dll");
-    std::wstring statusDll32Path = GetFullFilePath(L"AffinityStatus32.dll");
-    std::wstring transDll32Path = GetFullFilePath(L"AffinityTrans32.dll");
+    g_hideDllPath = GetFullFilePath(L"AffinityHide.dll");
+    g_unhideDllPath = GetFullFilePath(L"AffinityUnhide.dll");
+    g_statusDllPath = GetFullFilePath(L"AffinityStatus.dll");
+    g_transDllPath = GetFullFilePath(L"AffinityTrans.dll");
+    g_hideDll32Path = GetFullFilePath(L"AffinityHide32.dll");
+    g_unhideDll32Path = GetFullFilePath(L"AffinityUnhide32.dll");
+    g_statusDll32Path = GetFullFilePath(L"AffinityStatus32.dll");
+    g_transDll32Path = GetFullFilePath(L"AffinityTrans32.dll");
 
-    if (GetFileAttributes(hideDllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributes(g_hideDllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         Log("Error: AffinityHide.dll not found in the application directory.");
         system("pause");
         //return 1;
     }
 
-    if (GetFileAttributes(unhideDllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributes(g_unhideDllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         Log("Error: AffinityUnhide.dll not found in the application directory.");
         system("pause");
         //return 1;
     }
-    if (GetFileAttributes(transDllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributes(g_transDllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         Log("Error: AffinityTrans.dll not found in the application directory.");
         system("pause");
         //return 1;
     }
 
-    if (GetFileAttributes(statusDllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributes(g_statusDllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         Log("Error: AffinityStatus.dll not found in the application directory.");
         system("pause");
         //return 1;
     }
-    if (GetFileAttributes(hideDll32Path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributes(g_hideDll32Path.c_str()) == INVALID_FILE_ATTRIBUTES) {
         Log("Error: AffinityHide32.dll not found in the application directory.");
         system("pause");
         //return 1;
     }
 
-    if (GetFileAttributes(unhideDll32Path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributes(g_unhideDll32Path.c_str()) == INVALID_FILE_ATTRIBUTES) {
         Log("Error: AffinityUnhide32.dll not found in the application directory.");
         system("pause");
         //return 1;
     }
-    if (GetFileAttributes(transDll32Path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributes(g_transDll32Path.c_str()) == INVALID_FILE_ATTRIBUTES) {
         Log("Error: AffinityTrans32.dll not found in the application directory.");
         system("pause");
         //return 1;
     }
 
-    if (GetFileAttributes(statusDll32Path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributes(g_statusDll32Path.c_str()) == INVALID_FILE_ATTRIBUTES) {
         Log("Error: AffinityStatus32.dll not found in the application directory.");
         system("pause");
         //return 1;
@@ -292,6 +366,36 @@ int main() {
             }
 
             cout << "=================================" << endl;
+            system("pause");
+        }
+        else if (choice == 6) {
+            system("cls");
+            cout << "===== Continuous Monitoring =====" << endl;
+            cout << "Enter target process name to monitor (e.g., notepad.exe)." << endl;
+            cout << "Leave blank to stop monitoring." << endl;
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            std::string targetName;
+            getline(cin, targetName);
+
+            if (targetName.empty()) {
+                StopMonitoring();
+                Log("Monitoring stopped.");
+            }
+            else {
+                {
+                    std::lock_guard<std::mutex> lock(g_monitorMutex);
+                    g_targetProcessName = targetName;
+                }
+                if (!g_monitoring) {
+                    g_stopMonitoring = false;
+                    g_monitorThread = std::thread(MonitorProcessAffinity);
+                    g_monitoring = true;
+                    Log("Monitoring started for process: %s", targetName.c_str());
+                }
+                else {
+                    Log("Updated monitoring target to: %s", targetName.c_str());
+                }
+            }
             system("pause");
         }
         else if (choice == 2 || choice == 3 || choice == 4 || choice == 5) {
@@ -323,7 +427,7 @@ int main() {
                     // Set WDA_NONE
                     Log("Setting display affinity to WDA_NONE for %s (PID: %d)...",
                         selectedProc.name.c_str(), selectedProc.pid);
-                    if (InjectDLL(selectedProc.pid, unhideDllPath) && InjectDLL(selectedProc.pid, unhideDll32Path)) {
+                    if (InjectDLL(selectedProc.pid, g_unhideDllPath) && InjectDLL(selectedProc.pid, g_unhideDll32Path)) {
                         Log("Successfully set display affinity to normal mode.");
                     }
                     else {
@@ -334,7 +438,7 @@ int main() {
                     // Set WDA_MONITOR
                     Log("Setting display affinity to WDA_MONITOR for %s (PID: %d)...",
                         selectedProc.name.c_str(), selectedProc.pid);
-                    if (InjectDLL(selectedProc.pid, hideDllPath) && InjectDLL(selectedProc.pid, hideDll32Path)) {
+                    if (InjectDLL(selectedProc.pid, g_hideDllPath) && InjectDLL(selectedProc.pid, g_hideDll32Path)) {
                         Log("Successfully set display affinity to protected mode.");
                     }
                     else {
@@ -345,7 +449,7 @@ int main() {
                     // Set WDA_EXCLUDEFROMCAPTURE
                     Log("Setting display affinity to WDA_EXCLUDEFROMCAPTURE for %s (PID: %d)...",
                         selectedProc.name.c_str(), selectedProc.pid);
-                    if (InjectDLL(selectedProc.pid, transDllPath) && InjectDLL(selectedProc.pid, transDll32Path)) {
+                    if (InjectDLL(selectedProc.pid, g_transDllPath) && InjectDLL(selectedProc.pid, g_transDll32Path)) {
                         Log("Successfully set display affinity to excluded mode.");
                     }
                     else {
@@ -356,7 +460,7 @@ int main() {
                     // Get status
                     Log("Getting display affinity status for %s (PID: %d)...",
                         selectedProc.name.c_str(), selectedProc.pid);
-                    if (InjectDLL(selectedProc.pid, statusDllPath) && InjectDLL(selectedProc.pid, statusDll32Path)) {
+                    if (InjectDLL(selectedProc.pid, g_statusDllPath) && InjectDLL(selectedProc.pid, g_statusDll32Path)) {
                         Log("Status check completed. Check the MessageBox to see results.");
                     }
                     else {
@@ -372,5 +476,6 @@ int main() {
         }
     }
 
+    StopMonitoring();
     return 0;
 }
