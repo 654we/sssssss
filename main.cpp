@@ -5,6 +5,11 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <unordered_set>
+#include <algorithm>
+#include <atomic>
+#include <thread>
+#include <cctype>
 #include <TlHelp32.h>
 #include <Shlwapi.h>
 #pragma comment(lib,"shlwapi.lib")
@@ -32,6 +37,12 @@ struct ProcessInfo {
     DWORD pid;
     std::string name;
     bool hasWindows;
+};
+
+struct AutoConfig {
+    bool enabled;
+    int pollIntervalMs;
+    std::unordered_set<std::string> targets;
 };
 
 // Function to log messages
@@ -78,6 +89,69 @@ std::wstring GetFullFilePath(const std::wstring& filename) {
     return std::wstring{ fullPath };
 }
 
+std::string ToLowerCopy(const std::string& input) {
+    std::string output = input;
+    std::transform(output.begin(), output.end(), output.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return output;
+}
+
+std::vector<std::string> SplitTargets(const std::string& input) {
+    std::vector<std::string> targets;
+    std::string current;
+
+    for (char c : input) {
+        if (c == ';' || c == ',' || c == '
+' || c == '
+' || c == '	' || c == ' ') {
+            if (!current.empty()) {
+                targets.push_back(current);
+                current.clear();
+            }
+        }
+        else {
+            current.push_back(c);
+        }
+    }
+
+    if (!current.empty()) {
+        targets.push_back(current);
+    }
+
+    return targets;
+}
+
+AutoConfig LoadAutoConfig() {
+    AutoConfig config{};
+    config.enabled = false;
+    config.pollIntervalMs = 2000;
+
+    std::wstring configPath = GetFullFilePath(L"DisplayAffinityManager.ini");
+    if (GetFileAttributes(configPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        return config;
+    }
+
+    config.enabled = GetPrivateProfileIntW(L"AutoDetect", L"Enabled", 0, configPath.c_str()) != 0;
+    config.pollIntervalMs = GetPrivateProfileIntW(L"AutoDetect", L"PollIntervalMs", 2000, configPath.c_str());
+    if (config.pollIntervalMs < 200) {
+        config.pollIntervalMs = 200;
+    }
+
+    wchar_t buffer[2048] = { 0 };
+    GetPrivateProfileStringW(L"AutoDetect", L"Targets", L"", buffer, 2048, configPath.c_str());
+
+    char targetsBuffer[2048] = { 0 };
+    WideCharToMultiByte(CP_ACP, 0, buffer, -1, targetsBuffer, 2048, NULL, NULL);
+    auto targets = SplitTargets(targetsBuffer);
+    for (const auto& target : targets) {
+        if (!target.empty()) {
+            config.targets.insert(ToLowerCopy(target));
+        }
+    }
+
+    return config;
+}
+
 // Get a list of running processes
 std::vector<ProcessInfo> GetProcessList() {
     std::vector<ProcessInfo> processes;
@@ -89,7 +163,54 @@ std::vector<ProcessInfo> GetProcessList() {
     }
 
     PROCESSENTRY32 pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32);  // πÿº¸…Ë÷√
+void AutoDetectLoop(const AutoConfig& config,
+    const std::wstring& unhideDllPath,
+    const std::wstring& unhideDll32Path,
+    std::atomic<bool>& running) {
+    std::unordered_set<DWORD> injected;
+
+    while (running.load()) {
+        auto processes = GetProcessList();
+        std::unordered_set<DWORD> activePids;
+
+        for (const auto& proc : processes) {
+            activePids.insert(proc.pid);
+            if (!proc.hasWindows) {
+                continue;
+            }
+
+            std::string procName = ToLowerCopy(proc.name);
+            if (config.targets.find(procName) == config.targets.end()) {
+                continue;
+            }
+
+            if (injected.insert(proc.pid).second) {
+                Log("Auto-detected target %s (PID: %d). Injecting WDA_NONE...", proc.name.c_str(), proc.pid);
+                bool injected64 = InjectDLL(proc.pid, unhideDllPath);
+                bool injected32 = InjectDLL(proc.pid, unhideDll32Path);
+                if (injected64 && injected32) {
+                    Log("Auto-injection completed for %s (PID: %d).", proc.name.c_str(), proc.pid);
+                }
+                else {
+                    Log("Auto-injection failed for %s (PID: %d).", proc.name.c_str(), proc.pid);
+                }
+            }
+        }
+
+        for (auto it = injected.begin(); it != injected.end();) {
+            if (activePids.find(*it) == activePids.end()) {
+                it = injected.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+
+        Sleep(static_cast<DWORD>(config.pollIntervalMs));
+    }
+}
+
+    pe32.dwSize = sizeof(PROCESSENTRY32);  // ÂÖ≥ÈîÆËÆæÁΩÆ
 
     if (!Process32First(hProcessSnap, &pe32)) {
         CloseHandle(hProcessSnap);
@@ -101,12 +222,12 @@ std::vector<ProcessInfo> GetProcessList() {
         ProcessInfo pi;
         pi.pid = pe32.th32ProcessID;
 
-        // ◊™ªªΩ¯≥Ã√˚£®øÌ◊÷∑˚ °˙ ∂‡◊÷Ω⁄£©
+        // ËΩ¨Êç¢ËøõÁ®ãÂêçÔºàÂÆΩÂ≠óÁ¨¶ ‚Üí Â§öÂ≠óËäÇÔºâ
         char exeName[MAX_PATH];
         WideCharToMultiByte(CP_ACP, 0, pe32.szExeFile, -1, exeName, MAX_PATH, NULL, NULL);
         pi.name = exeName;
 
-        // ¥∞ø⁄ºÏ≤È¬ﬂº≠
+        // Á™óÂè£Ê£ÄÊü•ÈÄªËæë
         pi.hasWindows = false;
         EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
             ProcessInfo* pPi = reinterpret_cast<ProcessInfo*>(lParam);
@@ -115,7 +236,7 @@ std::vector<ProcessInfo> GetProcessList() {
 
             if (pid == pPi->pid && IsWindowVisible(hwnd)) {
                 pPi->hasWindows = true;
-                return FALSE;  // ’“µΩ¥∞ø⁄∫Û¡¢º¥Õ£÷π√∂æŸ
+                return FALSE;  // ÊâæÂà∞Á™óÂè£ÂêéÁ´ãÂç≥ÂÅúÊ≠¢Êûö‰∏æ
             }
             return TRUE;
             }, reinterpret_cast<LPARAM>(&pi));
@@ -271,6 +392,20 @@ int main() {
         system("pause");
         //return 1;
     }
+
+    AutoConfig autoConfig = LoadAutoConfig();
+    std::atomic<bool> autoRunning{ true };
+    std::thread autoThread;
+
+    if (autoConfig.enabled) {
+        if (autoConfig.targets.empty()) {
+            Log("Auto-detect enabled but no targets configured. Please update DisplayAffinityManager.ini.");
+        }
+        else {
+            Log("Auto-detect enabled. Monitoring targets...");
+            autoThread = std::thread(AutoDetectLoop, autoConfig, unhideDllPath, unhideDll32Path, std::ref(autoRunning));
+        }
+    }
     int choice = -1;
     while (choice != 0) {
         ShowMainMenu();
@@ -370,6 +505,11 @@ int main() {
 
             system("pause");
         }
+    }
+
+    if (autoThread.joinable()) {
+        autoRunning.store(false);
+        autoThread.join();
     }
 
     return 0;
